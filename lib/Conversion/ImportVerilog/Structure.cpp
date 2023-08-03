@@ -82,7 +82,10 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
   assert(moduleOp);
   auto builder =
       OpBuilder::atBlockEnd(&cast<moore::SVModuleOp>(moduleOp).getBodyBlock());
+  // save the insertion point, and replace the insertion point with builder's insertion at the follow
+  // then rootBuilder can access the builder's insertion point in Expressions.cpp
 
+  auto rootInsertionPoint = rootBuilder.saveInsertionPoint();
   for (auto &member : module->members()) {
     LLVM_DEBUG(llvm::dbgs()
                << "- Handling " << slang::ast::toString(member.kind) << "\n");
@@ -107,12 +110,20 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
     // Handle variables.
     if (member.kind == slang::ast::SymbolKind::Variable) {
       auto &varAst = member.as<slang::ast::VariableSymbol>();
-      auto loweredType = convertType(*varAst.getDeclaredType());
+      auto &declaredType = *varAst.getDeclaredType();
+      auto loweredType = convertType(declaredType);
       if (!loweredType)
         return failure();
+      auto *init = declaredType.getInitializer();
+      if(init){
+        rootBuilder.restoreInsertionPoint(builder.saveInsertionPoint());
+        convertExpr(varAst,loc);
+      }
+      else{
       builder.create<moore::VariableOp>(convertLocation(varAst.location),
                                         loweredType,
                                         builder.getStringAttr(varAst.name));
+      }
       continue;
     }
 
@@ -133,5 +144,6 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
     return failure();
   }
 
+  rootBuilder.restoreInsertionPoint(rootInsertionPoint);
   return success();
 }
