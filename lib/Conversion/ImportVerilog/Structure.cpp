@@ -86,6 +86,10 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
   // then rootBuilder can access the builder's insertion point in Expressions.cpp
 
   auto rootInsertionPoint = rootBuilder.saveInsertionPoint();
+
+  // set the scope we are active for
+  SymbolTableScopeT varScope(varSymbolTable);
+  
   for (auto &member : module->members()) {
     LLVM_DEBUG(llvm::dbgs()
                << "- Handling " << slang::ast::toString(member.kind) << "\n");
