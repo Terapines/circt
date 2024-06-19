@@ -188,9 +188,7 @@ struct ModuleVisitor : public BaseVisitor {
   LogicalResult visit(const slang::ast::MultiPortSymbol &) { return success(); }
 
   // Skip genvars.
-  LogicalResult visit(const slang::ast::GenvarSymbol &genvarNode) {
-    return success();
-  }
+  LogicalResult visit(const slang::ast::GenvarSymbol &) { return success(); }
 
   // Handle instances.
   LogicalResult visit(const slang::ast::InstanceSymbol &instNode) {
