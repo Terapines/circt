@@ -62,7 +62,5 @@ void InfoCollectionPass::runOnOperation() {
   getOperation()->walk([&](SVModuleOp moduleOp) {
     for (auto &op : moduleOp.getOps())
       decl.addValue(&op);
-
-    return WalkResult::advance();
   });
 }

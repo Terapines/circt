@@ -349,7 +349,7 @@ struct ModuleVisitor : public BaseVisitor {
     // Assign output values from the instance to the connected expression.
     for (auto [lvalue, output] : llvm::zip(outputValues, inst.getOutputs()))
       if (lvalue)
-        builder.create<moore::ContinuousAssignOp>(loc, lvalue, output);
+        builder.create<moore::ContinuousAssignOp>(loc, lvalue, output, Value{});
 
     return success();
   }
@@ -427,7 +427,7 @@ struct ModuleVisitor : public BaseVisitor {
       }
     }
 
-    builder.create<moore::ContinuousAssignOp>(loc, lhs, rhs);
+    builder.create<moore::ContinuousAssignOp>(loc, lhs, rhs, Value{});
     return success();
   }
 
@@ -762,7 +762,8 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
       portArg = builder.create<moore::ReadOp>(
           port.loc, cast<moore::RefType>(value.getType()).getNestedType(),
           port.arg);
-    builder.create<moore::ContinuousAssignOp>(port.loc, value, portArg);
+    builder.create<moore::ContinuousAssignOp>(port.loc, value, portArg,
+                                              Value{});
   }
   builder.create<moore::OutputOp>(lowering.op.getLoc(), outputs);
 

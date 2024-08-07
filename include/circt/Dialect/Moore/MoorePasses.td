@@ -15,6 +15,20 @@
 
 include "mlir/Pass/PassBase.td"
 
+def CombineNonBlockings : Pass<"moore-combine-nonblockings", "moore::SVModuleOp"> {
+    let summary = "Combine moore.nonblocking_assign ops";
+    let description = [{
+    }];
+    let constructor = "circt::moore::createCombineNonBlockingsPass()";
+}
+
+def DetectRegisters : Pass<"moore-detect-registers", "moore::SVModuleOp"> {
+    let summary = "";
+    let description = [{
+    }];
+    let constructor = "circt::moore::createDetectRegistersPass()";
+}
+
 def InfoCollection : Pass<"info-collection", "mlir::ModuleOp"> {
     let summary = "Collect all nets and variables declarations";
     let description = [{
@@ -24,6 +38,15 @@ def InfoCollection : Pass<"info-collection", "mlir::ModuleOp"> {
       initial value in net declaration or the assigned value).
     }];
     let constructor = "circt::moore::createInfoCollectionPass()";
+}
+
+def PullNonBlockingUp : Pass<"moore-pull-nonblocking-up", "moore::SVModuleOp"> {
+    let summary = "Pull non-blocking assignments upwards";
+    let description = [{
+      Improve the level of non-blocking assignments from the inner region to
+      its parent region, like from "{if(cond) x <= y;}" to "{x <= y if %cond;}"
+    }];
+    let constructor = "circt::moore::createPullNonBlockingUpPass()";
 }
 
 def SimplifyProcedures : Pass<"moore-simplify-procedures", "moore::SVModuleOp"> {
@@ -48,6 +71,13 @@ def LowerConcatRef : Pass<"moore-lower-concatref", "moore::SVModuleOp"> {
       conveniently lowering this kind of assignment.
     }];
     let constructor = "circt::moore::createLowerConcatRefPass()";
+}
+
+def MergeExtractRef : Pass<"moore-merge-extractref", "moore::SVModuleOp"> {
+    let summary = "Merge moore.extract_ref ops";
+    let description = [{
+    }];
+    let constructor = "circt::moore::createMergeExtractRefPass()";
 }
 
 #endif // CIRCT_DIALECT_MOORE_MOOREPASSES_TD

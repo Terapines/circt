@@ -1013,6 +1013,80 @@ ReadOp::removeBlockingUses(const MemorySlot &slot,
 }
 
 //===----------------------------------------------------------------------===//
+// RegisterOp
+//===----------------------------------------------------------------------===//
+
+void RegisterOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  setNameFn(getResult(), getName());
+}
+
+ParseResult RegisterOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto &builder = parser.getBuilder();
+  llvm::SMLoc loc = parser.getCurrentLocation();
+
+  using Op = OpAsmParser::UnresolvedOperand;
+
+  Op next, clk;
+  if (parser.parseOperand(next) || parser.parseKeyword("clock") ||
+      parser.parseOperand(clk))
+    return failure();
+
+  // Parse reset [sync|async] %reset, %value
+  std::optional<std::pair<Op, Op>> resetAndValue;
+  if (succeeded(parser.parseOptionalKeyword("reset"))) {
+    bool isAsync;
+    if (succeeded(parser.parseOptionalKeyword("async")))
+      isAsync = true;
+    else if (succeeded(parser.parseOptionalKeyword("sync")))
+      isAsync = false;
+    else
+      return parser.emitError(loc, "invalid reset, expected 'sync' or 'async'");
+    if (isAsync)
+      result.attributes.append("isAsync", builder.getUnitAttr());
+
+    resetAndValue = {{}, {}};
+    if (parser.parseOperand(resetAndValue->first) || parser.parseComma() ||
+        parser.parseOperand(resetAndValue->second))
+      return failure();
+  }
+
+  Type ty;
+  if (parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
+      parser.parseType(ty))
+    return failure();
+  result.addTypes({ty});
+
+  if (parser.resolveOperand(next, ty, result.operands))
+    return failure();
+
+  Type clkTy = IntType::get(result.getContext(), 1, Domain::TwoValued);
+  if (parser.resolveOperand(clk, clkTy, result.operands))
+    return failure();
+
+  if (resetAndValue) {
+    if (parser.resolveOperand(resetAndValue->first, clkTy, result.operands) ||
+        parser.resolveOperand(resetAndValue->second, ty, result.operands))
+      return failure();
+  }
+
+  return success();
+}
+
+void RegisterOp::print(::mlir::OpAsmPrinter &p) {
+  SmallVector<StringRef> elidedAttrs = {getIsAsyncAttrName()};
+
+  p << ' ' << getNext() << " clock " << getClk();
+
+  if (hasReset()) {
+    p << " reset " << (getIsAsync() ? "async" : "sync") << ' ';
+    p << getRst() << ", " << getRstValue();
+  }
+
+  p.printOptionalAttrDict((*this)->getAttrs(), elidedAttrs);
+  p << " : " << getNext().getType();
+}
+
+//===----------------------------------------------------------------------===//
 // TableGen generated logic.
 //===----------------------------------------------------------------------===//
 

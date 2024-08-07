@@ -226,7 +226,9 @@ static LogicalResult populateMooreTransforms(mlir::PassManager &pm) {
 
   pm.addPass(mlir::createSROA());
   pm.addPass(mlir::createMem2Reg());
+  modulePM.addPass(moore::createMergeExtractRefPass());
 
+  pm.addPass(mlir::createCSEPass());
   // TODO: like dedup pass.
 
   return success();
@@ -234,7 +236,6 @@ static LogicalResult populateMooreTransforms(mlir::PassManager &pm) {
 
 /// Convert Moore dialect IR into core dialect IR
 static LogicalResult populateMooreToCoreLowering(mlir::PassManager &pm) {
-  pm.addPass(mlir::createCSEPass());
   pm.addPass(createConvertMooreToCorePass());
 
   return success();

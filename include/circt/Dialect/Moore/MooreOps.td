@@ -300,9 +300,13 @@ def ReadOp : MooreOp<"read", [
 class AssignOpBase<string mnemonic, list<Trait> traits = []> :
     MooreOp<mnemonic, traits # [TypesMatchWith<"src and dst types match",
     "src", "dst", "RefType::get(cast<UnpackedType>($_self))">]> {
-  let arguments = (ins RefType:$dst, UnpackedType:$src);
+  let arguments = (ins
+    RefType:$dst, UnpackedType:$src,
+    Optional<AnySingleBitType>:$enable
+  );
   let assemblyFormat = [{
-    $dst `,` $src attr-dict `:` type($src)
+    $dst `,` $src (`if` $enable^)? attr-dict 
+    `:` type($src) (`,` type($enable)^)?
   }];
 }
 
@@ -330,7 +334,8 @@ def BlockingAssignOp : AssignOpBase<"blocking_assign", [
   }];
   let arguments = (ins
     Arg<RefType, "", [MemWrite]>:$dst,
-    UnpackedType:$src
+    UnpackedType:$src,
+    Optional<AnySingleBitType>:$enable
   );
 }
 
@@ -403,6 +408,36 @@ def EventOp : MooreOp<"wait_event", [
   let results = (outs);
   let assemblyFormat = [{
     $edge $input attr-dict `:` type($input)
+  }];
+}
+
+def RegisterOp : MooreOp<"register", [
+  Pure, SameVariadicOperandSize,
+  AllTypesMatch<["next", "data"/*, "rstValue"*/]>,
+  OptionalTypesMatchWith<"next and reset value must have same type",
+  "next", "rstValue", "$_self">,
+  MemoryEffects<[MemWrite, MemRead, MemAlloc]>,
+  DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>,
+  // AllTypesMatch doesn't work with Optional types yet.
+]> {
+  let summary = "Register with enable and sync or async reset";
+  let description = [{
+
+  }];
+
+  let arguments = (ins
+    UnpackedType:$next,
+    BitType:$clk,
+    StrAttr:$name,
+    Optional<BitType>:$rst, Optional<UnpackedType>:$rstValue,
+    UnitAttr:$isAsync
+  );
+  let results = (outs UnpackedType:$data);
+  let hasCustomAssemblyFormat = 1;
+
+  let extraClassDeclaration = [{
+    /// Check whether the register has a reset value.
+    bool hasReset() { return !!getRst(); }
   }];
 }
 
@@ -1278,4 +1313,25 @@ def YieldOp : MooreOp<"yield", [
   }];
   let hasVerifier = 1;
 }
+
+def MuxOp : MooreOp<"mux", [
+  Pure, AllTypesMatch<["trueValue", "falseValue", "result"]>
+]>{
+  let summary = "Return one or the other operand depending on a selector bit";
+  let description = [{
+    ```
+      %0 = mux %pred, %tvalue, %fvalue : i4
+    ```
+  }];
+
+  let arguments = (ins AnySingleBitType:$cond, UnpackedType:$trueValue,
+                       UnpackedType:$falseValue);
+  let results = (outs UnpackedType:$result);
+
+  let assemblyFormat = [{
+    $cond `,` $trueValue `,` $falseValue attr-dict
+    `:` type($cond) `,` qualified(type($result))
+  }];
+}
+
 #endif // CIRCT_DIALECT_MOORE_MOOREOPS

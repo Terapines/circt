@@ -1,7 +1,11 @@
 add_circt_dialect_library(CIRCTMooreTransforms
-LowerConcatRef.cpp
-SimplifyProcedures.cpp
+CombineNonBlockings.cpp
+DetectRegisters.cpp
 InfoCollection.cpp
+LowerConcatRef.cpp
+MergeExtractRef.cpp
+PullNonBlockingUp.cpp
+SimplifyProcedures.cpp
 
 
   DEPENDS

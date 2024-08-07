@@ -22,8 +22,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 namespace circt {
@@ -102,7 +102,6 @@ static LogicalResult lowerSCFIfOp(scf::IfOp ifOp,
                                   ConversionPatternRewriter &rewriter,
                                   DenseMap<Operation *, Value> &muxMap,
                                   SmallVector<Value> &allConds) {
-
   Value cond, trueValue, falseValue;
 
   // Traverse the 'else' region.
@@ -114,19 +113,14 @@ static LogicalResult lowerSCFIfOp(scf::IfOp ifOp,
         return failure();
 
     if (isa<BlockingAssignOp, NonBlockingAssignOp>(elseOp)) {
-      Operation *dstOp;
-      if (auto varOp = elseOp.getOperand(0).getDefiningOp<VariableOp>())
-        dstOp = varOp;
-      else if (auto extrRefOp =
-                   elseOp.getOperand(0).getDefiningOp<ExtractRefOp>())
-        if (auto varOp = extrRefOp.getInput().getDefiningOp<VariableOp>()) {
-          dstOp = varOp;
-        }
-      // auto *dstOp = elseOp.getOperand(0).getDefiningOp();
+      auto *dstOp = elseOp.getOperand(0).getDefiningOp();
       auto srcValue = rewriter.getRemappedValue(elseOp.getOperand(1));
       muxMap[dstOp] = srcValue;
     }
   }
+
+  if (ifOp.elseBlock())
+    rewriter.inlineBlockBefore(ifOp.elseBlock(), ifOp);
 
   // Traverse the 'then' region.
   for (auto &thenOp : ifOp.getThenRegion().getOps()) {
@@ -143,15 +137,7 @@ static LogicalResult lowerSCFIfOp(scf::IfOp ifOp,
 
     cond = ifOp.getCondition();
     if (isa<BlockingAssignOp, NonBlockingAssignOp>(thenOp)) {
-      Operation *dstOp;
-      if (auto varOp = thenOp.getOperand(0).getDefiningOp<VariableOp>())
-        dstOp = varOp;
-      else if (auto extrRefOp =
-                   thenOp.getOperand(0).getDefiningOp<ExtractRefOp>())
-        if (auto varOp = extrRefOp.getInput().getDefiningOp<VariableOp>()) {
-          dstOp = varOp;
-        }
-      // auto *dstOp = thenOp.getOperand(0).getDefiningOp();
+      auto *dstOp = thenOp.getOperand(0).getDefiningOp();
       trueValue = rewriter.getRemappedValue(thenOp.getOperand(1));
 
       // Maybe just the 'then' region exists. Like if(); no 'else'.
@@ -173,11 +159,50 @@ static LogicalResult lowerSCFIfOp(scf::IfOp ifOp,
       muxMap[dstOp] = muxOp;
     }
   }
-  rewriter.inlineBlockBefore(&ifOp.getThenRegion().front(), ifOp);
-  if (!ifOp.getElseRegion().empty()) {
-    rewriter.inlineBlockBefore(&ifOp.getElseRegion().front(), ifOp);
+  if (!ifOp.getThenRegion().empty()) {
+    rewriter.inlineBlockBefore(ifOp.thenBlock(), ifOp);
+    rewriter.eraseOp(ifOp);
   }
-  rewriter.eraseOp(ifOp);
+  return success();
+}
+
+/// Handle "always_comb".
+static LogicalResult lowerAlwaysComb(ProcedureOp procedureOp,
+                                     ConversionPatternRewriter &rewriter) {
+  DenseMap<Operation *, Value> muxMap;
+  for (auto &nestOp : procedureOp.getBodyRegion().getOps()) {
+    SmallVector<Value> allConds;
+    if (isa<scf::IfOp>(nestOp))
+      if (failed(lowerSCFIfOp(dyn_cast<scf::IfOp>(nestOp), rewriter, muxMap,
+                              allConds)))
+        return failure();
+  }
+
+  // Update the values of the variables.
+  for (auto muxOp : muxMap) {
+    auto from = rewriter.getRemappedValue(muxOp.first->getResult(0));
+    if (!from)
+      return failure();
+
+    StringAttr name;
+    if (auto varOp = llvm::dyn_cast_or_null<VariableOp>(muxOp.first))
+      name = varOp.getNameAttr();
+    else if (auto varOp =
+                 muxOp.getFirst()->getOperand(0).getDefiningOp<VariableOp>()) {
+      name = varOp.getNameAttr();
+    } else if (auto varOp = muxOp.getFirst()
+                                ->getOperand(0)
+                                .getDefiningOp()
+                                ->getOperand(0)
+                                .getDefiningOp<VariableOp>()) {
+      name = varOp.getNameAttr();
+    }
+
+    rewriter.setInsertionPoint(muxOp.first);
+    rewriter.create<hw::WireOp>(muxOp.first->getLoc(), muxOp.second, name);
+  }
+
+  rewriter.inlineBlockBefore(procedureOp.getBody(), procedureOp);
   return success();
 }
 
@@ -205,6 +230,9 @@ static LogicalResult lowerAlways(ProcedureOp procedureOp,
   // Collect `comb.mux`.
   DenseMap<Operation *, Value> muxMap;
 
+  if (procedureOp.getBodyRegion().getOps<EventOp>().empty())
+    isCombination = true;
+
   for (auto &nestOp : procedureOp.getBodyRegion().getOps()) {
     TypeSwitch<Operation *>(&nestOp)
         .Case<EventOp>([&](auto op) {
@@ -230,6 +258,20 @@ static LogicalResult lowerAlways(ProcedureOp procedureOp,
               }
         })
         .Case<NonBlockingAssignOp>([&](auto op) {
+          StringAttr name;
+          if (auto varOp = llvm::dyn_cast_or_null<VariableOp>(
+                  op.getDst().getDefiningOp()))
+            name = varOp.getNameAttr();
+          if (!name)
+            if (auto varOp =
+                    llvm::dyn_cast_or_null<VariableOp>(op.getDst()
+                                                           .getDefiningOp()
+                                                           ->getOperand(0)
+                                                           .getDefiningOp()
+                                                           ->getOperand(0)
+                                                           .getDefiningOp()))
+              name = varOp.getNameAttr();
+
           input = rewriter.getRemappedValue(op.getSrc());
 
           if (senLists.empty()) {
@@ -238,29 +280,25 @@ static LogicalResult lowerAlways(ProcedureOp procedureOp,
           }
 
           // Get the clock signal.
-          if (!clk) {
-            clk = rewriter.getRemappedValue(senLists.begin()->first);
-            clk = rewriter.create<seq::ToClockOp>(procedureOp->getLoc(), clk);
-          }
+          if (name) {
+            if (!clk) {
+              clk = rewriter.getRemappedValue(senLists.begin()->first);
+              clk = rewriter.create<seq::ToClockOp>(procedureOp->getLoc(), clk);
+            }
 
-          auto name =
-              cast<VariableOp>(op.getDst().getDefiningOp()).getNameAttr();
-          auto regOp = rewriter.create<seq::FirRegOp>(procedureOp->getLoc(),
-                                                      input, clk, name);
+            auto regOp = rewriter.create<seq::FirRegOp>(procedureOp->getLoc(),
+                                                        input, clk, name);
 
-          // Update the variables.
-          auto from = rewriter.getRemappedValue(op.getDst());
-          rewriter.replaceOp(from.getDefiningOp(), regOp);
+            // Update the variables.
+            auto from = rewriter.getRemappedValue(op.getDst());
+            rewriter.replaceOp(from.getDefiningOp(), regOp);
+          } else
+            emitError(procedureOp->getLoc()) << "empty name";
         })
         .Case<scf::IfOp>([&](auto op) {
           SmallVector<Value> allConds;
           if (failed(lowerSCFIfOp(op, rewriter, muxMap, allConds))) {
             falseLowerIf = true;
-            return;
-          }
-
-          if (senLists.empty()) {
-            isCombination = true;
             return;
           }
 
@@ -274,22 +312,25 @@ static LogicalResult lowerAlways(ProcedureOp procedureOp,
             StringAttr name;
             if (auto varOp = llvm::dyn_cast_or_null<VariableOp>(muxOp.first))
               name = varOp.getNameAttr();
-            // else if (auto extrRefOp =
-            //              llvm::dyn_cast_or_null<ExtractRefOp>(muxOp.first))
-            //   if (auto varOp =
-            //   extrRefOp.getInput().getDefiningOp<VariableOp>())
-            //     name = varOp.getNameAttr();
-            // auto name = cast<VariableOp>(muxOp.first).getNameAttr();
+            else if (auto varOp = muxOp.getFirst()
+                                      ->getOperand(0)
+                                      .getDefiningOp<VariableOp>()) {
+              name = varOp.getNameAttr();
+            } else if (auto varOp = muxOp.getFirst()
+                                        ->getOperand(0)
+                                        .getDefiningOp()
+                                        ->getOperand(0)
+                                        .getDefiningOp<VariableOp>()) {
+              name = varOp.getNameAttr();
+            }
 
+            if (!isa<comb::MuxOp>(muxOp.getSecond().getDefiningOp())) {
+              continue;
+            }
             auto mux = muxOp.getSecond().getDefiningOp<comb::MuxOp>();
+
             input = atThenRegion ? mux.getFalseValue() : mux.getTrueValue();
             rstValue = atThenRegion ? mux.getTrueValue() : mux.getFalseValue();
-
-            // auto *defOp = muxOp.second.getDefiningOp();
-
-            // input = atThenRegion ? defOp->getOperand(2) :
-            // defOp->getOperand(1); rstValue =
-            //     atThenRegion ? defOp->getOperand(1) : defOp->getOperand(2);
 
             auto regOp = rst ? rewriter.create<seq::FirRegOp>(
                                    procedureOp->getLoc(), input, clk, name, rst,
@@ -309,7 +350,8 @@ static LogicalResult lowerAlways(ProcedureOp procedureOp,
     // Always represents a combinational logic unit.
     // Like `always @(a, b, ...)` and `always @(*)`.
     if (isCombination) {
-      rewriter.inlineBlockBefore(procedureOp.getBody(), procedureOp);
+      if (failed(lowerAlwaysComb(procedureOp, rewriter)))
+        return failure();
       return success();
     }
   }
@@ -335,6 +377,10 @@ struct SVModuleOpConversion : public OpConversionPattern<SVModuleOp> {
     auto hwModuleOp =
         rewriter.create<hw::HWModuleOp>(op.getLoc(), op.getSymNameAttr(),
                                         getModulePortInfo(*typeConverter, op));
+    // Make hw.module have the same visibility as the moore.module.
+    // The entry/top level module is public, otherwise is private.
+    SymbolTable::setSymbolVisibility(hwModuleOp,
+                                     SymbolTable::getSymbolVisibility(op));
     rewriter.eraseBlock(hwModuleOp.getBodyBlock());
     rewriter.inlineRegionBefore(op.getBodyRegion(), hwModuleOp.getBodyRegion(),
                                 hwModuleOp.getBodyRegion().end());
@@ -379,7 +425,8 @@ struct ProcedureOpConversion : public OpConversionPattern<ProcedureOp> {
                   ConversionPatternRewriter &rewriter) const override {
     switch (adaptor.getKind()) {
     case ProcedureKind::AlwaysComb:
-      rewriter.inlineBlockBefore(op.getBody(), op);
+      if (failed(lowerAlwaysComb(op, rewriter)))
+        return failure();
       rewriter.eraseOp(op);
       return success();
     case ProcedureKind::Always:
@@ -401,47 +448,38 @@ struct ProcedureOpConversion : public OpConversionPattern<ProcedureOp> {
 // Declaration Conversion
 //===----------------------------------------------------------------------===//
 
-template <typename OpTy>
-struct DeclOpConversion : public OpConversionPattern<OpTy> {
-  using OpConversionPattern<OpTy>::OpConversionPattern;
-  using OpAdaptor = typename OpTy::Adaptor;
+struct NetOpConversion : public OpConversionPattern<NetOp> {
+  using OpConversionPattern::OpConversionPattern;
   LogicalResult
-  matchAndRewrite(OpTy op, OpAdaptor adaptor,
+  matchAndRewrite(NetOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value value = decl.getValue(op);
-    if (!value) {
-      Type resultType = OpConversionPattern<OpTy>::typeConverter->convertType(
-          op.getResult().getType());
-      value = rewriter.create<hw::ConstantOp>(op->getLoc(), resultType, 0);
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    Value value = adaptor.getAssignment();
+    if (value) {
+      if (auto readOp = value.template getDefiningOp<ReadOp>())
+        value = rewriter.getRemappedValue(readOp.getInput());
     } else
-      value = rewriter.getRemappedValue(value);
+      value = rewriter.create<hw::ConstantOp>(op->getLoc(), resultType, 0);
 
     rewriter.replaceOpWithNewOp<hw::WireOp>(op, value, op.getNameAttr());
     return success();
   }
 };
 
-//===----------------------------------------------------------------------===//
-// Declaration Conversion
-//===----------------------------------------------------------------------===//
-
 struct VariableOpConversion : public OpConversionPattern<VariableOp> {
   using OpConversionPattern::OpConversionPattern;
-
   LogicalResult
   matchAndRewrite(VariableOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type resultType = typeConverter->convertType(op.getResult().getType());
-    Value init = adaptor.getInitial();
-    // TODO: Unsupport x/z, so the initial value is 0.
-    if (!init && cast<RefType>(op.getResult().getType()).getDomain() ==
-                     Domain::FourValued)
-      return failure();
+    Value value = adaptor.getInitial();
+    if (value) {
+      if (auto readOp = value.template getDefiningOp<ReadOp>())
+        value = rewriter.getRemappedValue(readOp.getInput());
+    } else
+      value = rewriter.create<hw::ConstantOp>(op->getLoc(), resultType, 0);
 
-    if (!init)
-      init = rewriter.create<hw::ConstantOp>(op->getLoc(), resultType, 0);
-    rewriter.replaceOpWithNewOp<llhd::SigOp>(op, hw::InOutType::get(resultType),
-                                             op.getNameAttr(), init);
+    rewriter.replaceOpWithNewOp<hw::WireOp>(op, value, op.getNameAttr());
     return success();
   }
 };
@@ -561,6 +599,19 @@ struct ExtractRefOpConversion : public OpConversionPattern<ExtractRefOp> {
 
   LogicalResult
   matchAndRewrite(ExtractRefOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+    rewriter.replaceOpWithNewOp<comb::ExtractOp>(
+        op, resultType, adaptor.getInput(), adaptor.getLowBit());
+    return success();
+  }
+};
+
+struct DynExtractRefOpConversion : public OpConversionPattern<DynExtractRefOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(DynExtractRefOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type resultType = typeConverter->convertType(op.getResult().getType());
     auto width = typeConverter->convertType(op.getInput().getType())
@@ -946,7 +997,7 @@ struct ReadOpConversion : public OpConversionPattern<ReadOp> {
   }
 };
 
-struct EventOpConv : public OpConversionPattern<EventOp> {
+struct EventOpConversion : public OpConversionPattern<EventOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
@@ -966,6 +1017,37 @@ struct AssignOpConversion : public OpConversionPattern<SourceOp> {
   matchAndRewrite(SourceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
 
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct CAssignOpConversion : public OpConversionPattern<ContinuousAssignOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ContinuousAssignOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultType = typeConverter->convertType(op.getDst().getType());
+    StringAttr nameAttr;
+    if (auto varOp = op.getDst().getDefiningOp<VariableOp>()) {
+      nameAttr = varOp.getNameAttr();
+    }
+    if (auto netOp = op.getDst().getDefiningOp<NetOp>()) {
+      nameAttr = netOp.getNameAttr();
+      auto from = rewriter.getRemappedValue(op.getDst());
+      rewriter.replaceOpWithNewOp<hw::WireOp>(from.getDefiningOp(), resultType,
+                                              adaptor.getSrc(), nameAttr,
+                                              hw::InnerSymAttr{});
+    }
+    rewriter.setInsertionPointAfterValue(op.getDst());
+    rewriter.create<hw::WireOp>(op->getLoc(), resultType, adaptor.getSrc(),
+                                nameAttr, hw::InnerSymAttr{});
+    // } else {
+    //   auto reValue = rewriter.getRemappedValue(op.getDst());
+    //   if (auto wire = reValue.getDefiningOp<hw::WireOp>())
+    //     rewriter.replaceAllUsesWith(wire.getInput(), adaptor.getSrc());
+    // }
     rewriter.eraseOp(op);
     return success();
   }
@@ -1033,11 +1115,29 @@ static void populateLegality(ConversionTarget &target) {
       [](hw::OutputOp op) { return !hasMooreType(op.getOutputs()); });
 
   target.addDynamicallyLegalOp<scf::YieldOp>([](scf::YieldOp op) {
-    return isa<scf::WhileOp>(op->getParentOp()) &&
-           cast<scf::WhileOp>(op->getParentOp())
-                   .getAfterBody()
-                   ->getTerminator() == op;
+    if (auto whileOp = llvm::dyn_cast_or_null<scf::WhileOp>(op->getParentOp()))
+      return whileOp.getYieldOp() == op;
+    // if (auto ifOp = llvm::dyn_cast_or_null<scf::IfOp>(op->getParentOp()))
+    //   return (ifOp.thenYield() == op) || (ifOp.elseYield() == op);
+    return false;
   });
+
+  // target.addDynamicallyLegalOp<scf::IfOp>([](scf::IfOp op) {
+  //   llvm::function_ref<bool(Region &)> checkRegion;
+  //   checkRegion = [&](auto &region) {
+  //     for (auto &op : region.getOps()) {
+  //       if (isa<NonBlockingAssignOp>(op))
+  //         return false;
+  //       if (auto ifOp = dyn_cast<scf::IfOp>(op))
+  //         if (!checkRegion(ifOp.getThenRegion()) ||
+  //             !checkRegion(ifOp.getElseRegion()))
+  //           return false;
+  //     }
+  //     return true;
+  //   };
+  //   return checkRegion(op.getThenRegion()) &&
+  //   checkRegion(op.getElseRegion());
+  // });
 }
 
 static void populateTypeConversion(TypeConverter &typeConverter) {
@@ -1093,12 +1193,14 @@ static void populateOpConversion(RewritePatternSet &patterns,
   // clang-format off
   patterns.add<
     // Patterns of declaration operations.
-    DeclOpConversion<VariableOp>, DeclOpConversion<NetOp>,
+    VariableOpConversion, NetOpConversion,
     
     // Patterns of miscellaneous operations.
     ConstantOpConv, ConcatOpConversion, ReplicateOpConversion,
-    ExtractOpConversion, DynExtractOpConversion, ConversionOpConversion,
-    ReadOpConversion, NamedConstantOpConv,
+    ExtractOpConversion, DynExtractOpConversion, ExtractRefOpConversion,
+    DynExtractRefOpConversion, ConversionOpConversion, NamedConstantOpConv,
+    ReadOpConversion, ProcedureOpConversion, EventOpConversion,
+    ConcatRefOpConversion,
 
     // Patterns of unary operations.
     ReduceAndOpConversion, ReduceOrOpConversion, ReduceXorOpConversion,
@@ -1139,7 +1241,9 @@ static void populateOpConversion(RewritePatternSet &patterns,
     ShrOpConversion, ShlOpConversion, AShrOpConversion,
 
     // Patterns of assignment operations.
-    AssignOpConversion<ContinuousAssignOp>, AssignOpConversion<BlockingAssignOp>,
+    // AssignOpConversion<ContinuousAssignOp>,
+    CAssignOpConversion,
+    AssignOpConversion<BlockingAssignOp>,
     AssignOpConversion<NonBlockingAssignOp>,
 
     // Patterns of branch operations.
@@ -1181,6 +1285,11 @@ std::unique_ptr<OperationPass<ModuleOp>> circt::createConvertMooreToCorePass() {
 void MooreToCorePass::runOnOperation() {
   MLIRContext &context = getContext();
   ModuleOp module = getOperation();
+
+  // auto pm = PassManager::on<ModuleOp>(&context);
+  // pm.addPass(moore::createInfoCollectionPass());
+  // if (failed(pm.run(module)))
+  //   return signalPassFailure();
 
   ConversionTarget target(context);
   TypeConverter typeConverter;
